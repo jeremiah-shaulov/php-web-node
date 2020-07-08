@@ -1400,7 +1400,7 @@ class Child
 		}
 	}
 
-	protected static function get_script_filename(callable $onerror_func=null, callable $onresolvepath_func=null)
+	protected static function get_script_filename(callable $onerror_func, callable $onresolvepath_func=null)
 	{	$filename = $_SERVER['SCRIPT_FILENAME'] ?? '';
 		if (strlen($filename) == 0)
 		{	throw new Exception("No SCRIPT_FILENAME given");
