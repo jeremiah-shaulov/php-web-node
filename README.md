@@ -266,7 +266,7 @@ $server->onrequest
 (	function(Request $request)
 	{	if (empty($request->get['page-id']))
 		{	http_response_code(404);
-			PhpWebNode\header("Expires: 3600");
+			PhpWebNode\header('Expires: '.gmdate('r', time()+60*60));
 			throw new Exception("Page doesn't exist"); // cancel the request
 		}
 	}
