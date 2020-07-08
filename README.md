@@ -17,7 +17,7 @@ To use php-web-node we need to pass 3 steps:
 
 We need a master application that will work as PHP-FPM service. Let's call it server.php:
 
-```
+```php
 <?php
 
 require_once 'php-web-node/php-web-node.php';
@@ -75,7 +75,7 @@ The DocumentRoot directory must exist.
 
 There's important difference between PHP-FPM and php-web-node. Let's say we have such `hello.php` script:
 
-```
+```php
 <?php
 
 if (!isset($n_request)) $n_request = 1;
@@ -90,7 +90,7 @@ If we'll serve it with php-web-node, we'll see that `$n_request` is incrementing
 
 Child process executes `require 'hello.php'` each request within the same environment. This puts limitations on what `hello.php` can do. For example:
 
-```
+```php
 <?php
 
 function get_n_request()
@@ -112,7 +112,7 @@ There are 2 solutions to this problem.
 1. Put all functions and classes to external files, and `require_once` them.
 2. Use `PhpWebNode\set_request_handler()`
 
-```
+```php
 <?php
 
 require_once 'php-web-node/php-web-node.php';
@@ -136,7 +136,7 @@ If you'll execute the above script from PHP-FPM, it will behave the same, becaus
 
 Another important difference between php-web-node and PHP-FPM is that with php-web-node you cannot use built-in functions like `header()`, `setcookie()`, etc. Instead you need to use corresponding functions from `PhpWebNode` namespace: `PhpWebNode\header()`, `PhpWebNode\setcookie()`, etc.
 
-```
+```php
 <?php
 
 require_once 'php-web-node/php-web-node.php';
@@ -160,7 +160,7 @@ PhpWebNode\set_request_handler
 
 The master application configures and starts the FastCGI server. Also it can perform another operations, but it's important to understand, that no blocking system calls must be executed from it, because the blocking calls, like connecting to database, will pause handling incoming HTTP requests. The following master application is alright, it only performs nonblocking operations.
 
-```
+```php
 <?php
 
 require_once 'php-web-node/php-web-node.php';
@@ -221,7 +221,7 @@ By default there's only 1 pool called `''` (empty string). The 'pm.max_children'
 
 To catch and examine incoming HTTP requests we can set `$server->onrequest()` callback.
 
-```
+```php
 <?php
 
 require_once 'php-web-node/php-web-node.php';
@@ -261,7 +261,7 @@ Child process can check it's pool Id by calling `PhpWebNode\get_pool_id()`.
 
 Another thing that `$server->onrequest()` callback can do, is throwing exception to cancel the request without forwarding it to a child process.
 
-```
+```php
 $server->onrequest
 (	function(Request $request)
 	{	if (empty($request->get['page-id']))
