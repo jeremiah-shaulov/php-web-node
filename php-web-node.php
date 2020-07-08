@@ -201,13 +201,15 @@ const FCGI_KEEP_CONN          =  1;
  **/
 class Server
 {	// Settings given in constructor
-	private $sock_domain, $sock_type, $sock_protocol, $address, $port, $backlog, $pm_max_children, $pm_process_idle_timeout, $pm_max_requests, $listen_owner, $listen_group, $listen_mode, $user, $group, $request_terminate_timeout, $onerror_func='error_log', $onrequest_func, $onrequestcomplete_func;
+	private $sock_domain, $sock_type, $sock_protocol, $address, $port, $backlog, $pm_max_children, $pm_process_idle_timeout, $pm_max_requests, $listen_owner, $listen_group, $listen_mode, $user, $group, $request_terminate_timeout;
 
+	// Settings set after construction
+	private $onerror_func='error_log', $onrequest_func, $onrequestcomplete_func;
+
+	// Other private vars
 	private array $server_accepted_socks = []; // I will add elements here when i get socket_accept($server), and when server will close the communication with me, i will delete corresponding elements
 	private ChildrenPool $children_pool;
 	private array $employed_children = []; // children picked from $children_pool
-
-	// Other private vars
 	private $tasks=[], $next_task_time=0.0;
 
 	public function __construct(array $options=null)
@@ -447,8 +449,7 @@ class Server
 							// Read records from server, and put them to children
 							$offset = 0;
 							while (($header = fcgi_get_record_header($accepted->buffer_read, $offset)) !== null)
-							{	$type = $header['type'];
-								switch ($type)
+							{	switch ($header['type'])
 								{	case FCGI_BEGIN_REQUEST:
 										list('R' => $role, 'F' => $flags) = unpack('nR/CF', $accepted->buffer_read, $offset-$header['padding']-$header['length']);
 										if ($flags&FCGI_KEEP_CONN == 0)
@@ -576,7 +577,7 @@ class Server
 										$nvp = null; // free memory
 										break;
 									default:
-										$accepted->buffer_write .= new FcgiRecordUnknownType($type);
+										$accepted->buffer_write .= new FcgiRecordUnknownType($header['type']);
 								}
 							}
 							if ($offset > 0)
@@ -1090,7 +1091,7 @@ class ChildrenPool
 			}
 		}
 
-		// Kill bad zobmies
+		// Kill bad zombies
 		for ($i=count($this->zombies)-1; $i>=0; $i--)
 		{	$child = $this->zombies[$i];
 			if ($time-$child->since >= FORCE_KILL_ZOMBIE_AFTER or $force_kill_all)
