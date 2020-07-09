@@ -594,6 +594,7 @@ class Server
 						}
 					}
 					assert($child and $child->sock==$r);
+					assert(isset($this->server_accepted_socks[$child->n_accepted]));
 					$accepted = $this->server_accepted_socks[$child->n_accepted];
 					$chunk = socket_read($r, BUFFER_SIZE);
 
@@ -882,6 +883,12 @@ class Server
 		assert($this->server_accepted_socks[$n_accepted]->n_mux_children === 0);
 		socket_close($this->server_accepted_socks[$n_accepted]->sock);
 		array_splice($this->server_accepted_socks, $n_accepted, 1);
+		for ($i=count($this->server_accepted_socks)-1; $i>=$n_accepted; $i--)
+		{	foreach ($this->server_accepted_socks[$i]->read_request_buffers as $read_request_buffer)
+			{	$read_request_buffer->n_accepted--;
+				assert($read_request_buffer->n_accepted == $i);
+			}
+		}
 	}
 }
 
