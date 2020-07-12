@@ -13,6 +13,8 @@ function get_pool_id()
 {	return _\Child::$the_pool_id;
 }
 
+/**	$for_filename must be absolute path.
+ **/
 function set_request_handler(string $for_filename, callable $func)
 {	if (!_\Child::$is_php_web_node)
 	{	$func();
@@ -28,12 +30,15 @@ function send_message($message)
 	}
 }
 
-function file_get_contents($filename, $use_include_path=false, $context=null, $offset=0, $maxlen=0x7FFFFFFF)
-{	if (!_\Child::$is_php_web_node or $filename!='php://input')
-	{	return file_get_contents($filename, $use_include_path, $context, $offset, $maxlen);
+function file_get_contents($filename, $use_include_path=false, $context=null, $offset=0, $maxlen=null)
+{	if (_\Child::$is_php_web_node or $filename!='php://input')
+	{	return substr(_\Child::$stdin, $offset, $maxlen===null ? 0x7FFFFFFF : $maxlen);
+	}
+	else if ($maxlen === null)
+	{	return \file_get_contents($filename, $use_include_path, $context, $offset);
 	}
 	else
-	{	return substr(_\Child::$stdin, $offset, $maxlen);
+	{	return \file_get_contents($filename, $use_include_path, $context, $offset, $maxlen);
 	}
 }
 
@@ -205,6 +210,7 @@ class Server
 
 	// Settings set after construction
 	private $onerror_func='error_log', $onrequest_func, $onrequestcomplete_func;
+	private int $onrequest_catch_input_limit = 0;
 
 	// Other private vars
 	private array $server_accepted_socks = []; // I will add elements here when i get socket_accept($server), and when server will close the communication with me, i will delete corresponding elements
@@ -235,14 +241,14 @@ class Server
 		$this->port = $port;
 		$this->backlog = max(0, intval($options['listen.backlog'] ?? 0));
 		$this->pm_max_children = max(1, intval($options['pm.max_children'] ?? 8));
-		$this->pm_process_idle_timeout = max(0.1, floatval($options['pm.process_idle_timeout'] ?? 30.0));
+		$this->pm_process_idle_timeout = max(0.1, conv_units($options['pm.process_idle_timeout'] ?? 30.0, true));
 		$this->pm_max_requests = max(0, intval($options['pm.max_requests'] ?? 0));
 		$this->listen_owner = $options['listen.owner'] ?? null;
 		$this->listen_group = $options['listen.group'] ?? null;
 		$this->listen_mode = is_int($options['listen.mode'] ?? null) ? $options['listen.mode'] : base_convert($options['listen.mode'] ?? '770', 8, 10);
 		$this->user = $options['user'] ?? null;
 		$this->group = $options['group'] ?? null;
-		$this->request_terminate_timeout = max(0, intval($options['request_terminate_timeout'] ?? 0)); // TODO: units
+		$this->request_terminate_timeout = max(0, conv_units($options['request_terminate_timeout'] ?? 0, true));
 
 		// TODO: fork_call
 
@@ -345,6 +351,7 @@ class Server
 			// Set other variables
 			$next_children_task_time = 0.0; // when next time to run $this->children_pool->children_task()
 			$tasks_each = min(TASKS_DEFAULT_EACH, $this->pm_process_idle_timeout, $this->request_terminate_timeout<=0 ? TASKS_DEFAULT_EACH : $this->request_terminate_timeout);
+			$post_max_size = conv_units(ini_get('post_max_size'));
 
 			// Function that will be called to initialize a child process. It will close parent sockets, and free parent resources.
 			$this->children_pool->onpreparechild_func = function()
@@ -460,7 +467,7 @@ class Server
 										}
 										else if (count($accepted->read_request_buffers) > $this->pm_max_children*MAX_PENDING_REQS_FACTOR)
 										{	$accepted->buffer_write .= new FcgiRecordEndRequest($header['request_id'], FCGI_OVERLOADED);
-											console_log($this->onerror_func, "503 Server busy"); // TODO: handler for 503
+											console_log($this->onerror_func, "503 Server busy");
 										}
 										else
 										{	$accepted->read_request_buffers[] = new ReadRequestBuffer($n_accepted, $header['request_id']);
@@ -470,19 +477,20 @@ class Server
 									case FCGI_ABORT_REQUEST:
 										console_log($this->onerror_func, "Request aborted");
 										$request_id = $header['request_id'];
+										// Find read_request_buffer
+										foreach ($accepted->read_request_buffers as $n_buffer => $read_request_buffer) // $read_request_buffer will not exist in $accepted if i rejected this request with FCGI_OVERLOADED
+										{	if ($read_request_buffer->request_id == $request_id)
+											{	http_response_code(500);
+												Child::$headers = [];
+												$this->end_request($accepted, $request_id, "Request aborted");
+												array_splice($accepted->read_request_buffers, $n_buffer, 1);
+												break 2;
+											}
+										}
 										// Find child
 										foreach ($this->employed_children as $child) // $child will not exist in $this->employed_children if i rejected this request with FCGI_OVERLOADED
 										{	if ($child->n_accepted==$n_accepted and $child->request_id==$request_id)
 											{	$child->is_aborted = true;
-												break 2;
-											}
-										}
-										// Find read_request_buffer
-										foreach ($accepted->read_request_buffers as $n_buffer => $read_request_buffer) // $read_request_buffer will not exist in $accepted if i rejected this request with FCGI_OVERLOADED
-										{	if ($read_request_buffer->request_id == $request_id)
-											{	$accepted->buffer_write .= fcgi_pack_data(FCGI_STDOUT, $request_id, "Status: 500\r\nContent-Type: text/html\r\n\r\nRequest aborted") . new FcgiRecordEndRequest($request_id, FCGI_REQUEST_COMPLETE);
-												$accepted->n_mux_children--;
-												array_splice($accepted->read_request_buffers, $n_buffer, 1);
 												break 2;
 											}
 										}
@@ -496,39 +504,8 @@ class Server
 												$rec_len = 8 + $len + $header['padding'];
 												$read_request_buffer->buffer .= substr($accepted->buffer_read, $offset-$rec_len, $rec_len);
 												if ($len == 0)
-												{	// TODO: respect post_max_size, upload_max_filesize, max_file_uploads
-													if ($this->onrequest_func !== null)
-													{	$request = new \PhpWebNode\Request($read_request_buffer->buffer);
-														try
-														{	// Prepare environment for function calls like http_response_code(), PhpWebNode\header(), etc.
-															http_response_code(500);
-															Child::$headers = [];
-															$read_request_buffer->pool_id = (string)call_user_func($this->onrequest_func, $request);
-														}
-														catch (Throwable $e)
-														{	// $onrequest_func can throw exception to cancel this request
-															$accepted->buffer_write .= fcgi_pack_data(FCGI_STDOUT, $request_id, Child::get_headers_str().$e->getMessage()) . new FcgiRecordEndRequest($request_id, FCGI_REQUEST_COMPLETE);
-															$accepted->n_mux_children--;
-															console_log($this->onerror_func, "Request cancelled: {$request->server['REQUEST_METHOD']} {$request->server['REQUEST_URI']}");
-															array_splice($accepted->read_request_buffers, $n_buffer, 1);
-															break 2;
-														}
-														finally
-														{	$request = null; // free memory
-														}
-													}
-													$child = $this->children_pool->add_request($read_request_buffer);
-													if ($child === false)
-													{	$accepted->buffer_write .= new FcgiRecordEndRequest($request_id, FCGI_OVERLOADED);
-														$accepted->n_mux_children--;
-														console_log($this->onerror_func, !strlen($read_request_buffer->pool_id) ? "503 Server busy" : "Pool {$read_request_buffer->pool_id}: 503 Server busy");
-														array_splice($accepted->read_request_buffers, $n_buffer, 1);
-													}
-													else if ($child !== null)
-													{	$this->employed_children[] = $child;
-														$write[] = $child->sock;
-														array_splice($accepted->read_request_buffers, $n_buffer, 1);
-													}
+												{	$read_request_buffer->params_written = true;
+													$this->add_request_if_complete($accepted, $read_request_buffer, $n_buffer, $write);
 												}
 												break 2;
 											}
@@ -536,26 +513,43 @@ class Server
 										break;
 									case FCGI_STDIN:
 										$request_id = $header['request_id'];
+										// Find read_request_buffer
+										foreach ($accepted->read_request_buffers as $n_buffer => $read_request_buffer) // $read_request_buffer will not exist in $accepted if i rejected this request with FCGI_OVERLOADED
+										{	if ($read_request_buffer->request_id == $request_id)
+											{	$len = $header['length'];
+												$read_request_buffer->stdin_len += $len;
+												if ($read_request_buffer->stdin_len>$post_max_size and $post_max_size>0)
+												{	$read_request_buffer->stdin_len = -1;
+												}
+												$rec_len = 8 + $len + $header['padding'];
+												if ($read_request_buffer->stdin_len != -1)
+												{	$read_request_buffer->buffer .= substr($accepted->buffer_read, $offset-$rec_len, $rec_len);
+												}
+												if ($len == 0)
+												{	$read_request_buffer->stdin_written = true;
+												}
+												$this->add_request_if_complete($accepted, $read_request_buffer, $n_buffer, $write);
+												break 2;
+											}
+										}
 										// Find child
 										foreach ($this->employed_children as $child) // $child will not exist in $this->employed_children if i rejected this request with FCGI_OVERLOADED
 										{	if ($child->n_accepted==$n_accepted and $child->request_id==$request_id)
 											{	$len = $header['length'];
+												$child->stdin_len += $len;
+												if ($child->stdin_len>$post_max_size and $post_max_size>0)
+												{	$child->stdin_len = -1;
+												}
 												$rec_len = 8 + $len + $header['padding'];
-												$child->buffer .= substr($accepted->buffer_read, $offset-$rec_len, $rec_len);
+												if ($child->stdin_len != -1)
+												{	$child->buffer .= substr($accepted->buffer_read, $offset-$rec_len, $rec_len);
+												}
 												if ($len == 0)
 												{	$child->stdin_written = true;
-												}
-												break 2;
-											}
-										}
-										// Find read_request_buffer
-										foreach ($accepted->read_request_buffers as $read_request_buffer) // $read_request_buffer will not exist in $accepted if i rejected this request with FCGI_OVERLOADED
-										{	if ($read_request_buffer->request_id == $request_id)
-											{	$len = $header['length'];
-												$rec_len = 8 + $len + $header['padding'];
-												$read_request_buffer->buffer .= substr($accepted->buffer_read, $offset-$rec_len, $rec_len);
-												if ($len == 0)
-												{	$read_request_buffer->stdin_written = true;
+													if ($child->stdin_len == -1)
+													{	// stdin cut
+														$child->buffer .= pack("C2x6", 1, FCGI_STDIN); // i signal to the child about incomplete FCGI_STDIN by zero request_id in the last FCGI_STDIN packet. see below
+													}
 												}
 												break 2;
 											}
@@ -780,8 +774,9 @@ class Server
 		This function must not change error handler (set_error_handler()). If you load some library from within this function, make sure it doesn't do so.
 		This function must not perform blocking operations, because they will freeze handling of HTTP requests.
 	 **/
-	public function onrequest(callable $onrequest_func=null)
+	public function onrequest(callable $onrequest_func=null, int $catch_input_limit=0)
 	{	$this->onrequest_func = $onrequest_func;
+		$this->onrequest_catch_input_limit = $onrequest_func===null || $catch_input_limit<=0 ? 0 : $catch_input_limit;
 	}
 
 	/**	Set callback function that will be called once for each completed HTTP request.
@@ -837,12 +832,62 @@ class Server
 		$this->next_task_time = min($this->next_task_time, $at);
 	}
 
+	private function add_request_if_complete(ServerAcceptedSock $accepted, ReadRequestBuffer $read_request_buffer, int $n_buffer, &$write)
+	{	assert($accepted->read_request_buffers[$n_buffer] === $read_request_buffer);
+		if ($read_request_buffer->params_written and $read_request_buffer->stdin_written || $read_request_buffer->stdin_len>=$this->onrequest_catch_input_limit and !$read_request_buffer->is_added)
+		{	if ($this->onrequest_func !== null)
+			{	$request = new \PhpWebNode\Request($read_request_buffer->buffer, $read_request_buffer->stdin_written);
+				try
+				{	// Prepare environment for function calls like http_response_code(), PhpWebNode\header(), etc.
+					http_response_code(500);
+					Child::$headers = [];
+					$read_request_buffer->pool_id = (string)call_user_func($this->onrequest_func, $request);
+				}
+				catch (Throwable $e)
+				{	// $onrequest_func can throw exception to cancel this request
+					$accepted->buffer_write .= fcgi_pack_data(FCGI_STDOUT, $read_request_buffer->request_id, Child::get_headers_str().$e->getMessage()) . new FcgiRecordEndRequest($read_request_buffer->request_id, FCGI_REQUEST_COMPLETE);
+					$accepted->n_mux_children--;
+					array_splice($accepted->read_request_buffers, $n_buffer, 1);
+					console_log($this->onerror_func, "Request cancelled: {$request->server['REQUEST_METHOD']} {$request->server['REQUEST_URI']}");
+					return;
+				}
+			}
+			$child = $this->children_pool->add_request($read_request_buffer);
+			if ($child === null)
+			{	$read_request_buffer->is_added = true;
+				return;
+			}
+			if ($child === false)
+			{	http_response_code(503);
+				Child::$headers = [];
+				$this->end_request($accepted, $read_request_buffer->request_id, "");
+				array_splice($accepted->read_request_buffers, $n_buffer, 1);
+				console_log($this->onerror_func, "503 Server busy");
+			}
+			else
+			{	$this->employed_children[] = $child;
+				$write[] = $child->sock;
+				array_splice($accepted->read_request_buffers, $n_buffer, 1);
+			}
+		}
+	}
+
+	private function end_request(ServerAcceptedSock $accepted, int $request_id, string $default_message)
+	{	// TODO: custom handler
+		$accepted->buffer_write .= fcgi_pack_data(FCGI_STDOUT, $request_id, Child::get_headers_str().$default_message) . new FcgiRecordEndRequest($request_id, http_response_code()==503 ? FCGI_OVERLOADED : FCGI_REQUEST_COMPLETE);
+		$accepted->n_mux_children--;
+	}
+
 	private function recycle_child(int $n_child, int $child_state)
 	{	$child = $this->employed_children[$n_child];
 		$accepted = $this->server_accepted_socks[$child->n_accepted];
-		$accepted->n_mux_children--;
 		if ($child_state != CHILD_STATE_ALIVE)
-		{	$accepted->buffer_write .= new FcgiRecordEndRequest($child->request_id, FCGI_REQUEST_COMPLETE);
+		{	http_response_code(500);
+			Child::$headers = [];
+			$this->end_request($accepted, $child->request_id, "");
+		}
+		else
+		{	$accepted->n_mux_children--;
 		}
 		if ($this->onrequestcomplete_func!==null and $child_state==CHILD_STATE_ALIVE)
 		{	try
@@ -909,7 +954,10 @@ class ReadRequestBuffer
 {	public int $n_accepted;
 	public int $request_id;
 	public string $buffer = '';
+	public int $stdin_len = 0;
+	public bool $params_written = false;
 	public bool $stdin_written = false;
+	public bool $is_added = false;
 	public string $pool_id = '';
 
 	public function __construct(int $n_accepted, int $request_id)
@@ -1132,6 +1180,7 @@ class Child
 	public string $stderr_buffer = ''; // FCGI_STDERR records read from child. they are used to send messages from child to parent
 	public bool $is_aborted = false; // is set when FCGI server sends FCGI_ABORT_REQUEST. if this is set, the stdout must not be sent back to the server
 	public bool $stdin_written = false; // is set when both FCGI_PARAMS and FCGI_STDIN records are read from the server to $buffer
+	public int $stdin_len = 0;
 	public bool $is_reading_back = false; // is set when $stdin_written and strlen($buffer)==0, meaning that the whole request is written to $sock, and now we are reading the response back from $sock to $buffer
 
 	// all the static fields are used by child process only
@@ -1186,6 +1235,7 @@ class Child
 		$this->request_id = $read_request_buffer->request_id;
 		$this->buffer = $read_request_buffer->buffer;
 		$this->stdin_written = $read_request_buffer->stdin_written;
+		$this->stdin_len = $read_request_buffer->stdin_len;
 		$this->since = microtime(true);
 	}
 
@@ -1293,6 +1343,7 @@ class Child
 			self::$header_callback = null;
 			$gzip_ctx = null;
 			http_response_code(200);
+			clearstatcache();
 			$_GET = [];
 			$_POST = [];
 			$_COOKIE = [];
@@ -1415,6 +1466,10 @@ class Child
 		}
 		if ($onresolvepath_func !== null)
 		{	$filename = $onresolvepath_func($filename);
+		}
+		else if (!empty($_SERVER['CONTEXT_DOCUMENT_ROOT']) and ($pos = strpos($filename, $_SERVER['CONTEXT_DOCUMENT_ROOT'])) !== false)
+		{	// apache2 uses CONTEXT_DOCUMENT_ROOT when "Alias" directive is given
+			$filename = substr($filename, $pos);
 		}
 		else if (!empty($_SERVER['DOCUMENT_ROOT']) and ($pos = strpos($filename, $_SERVER['DOCUMENT_ROOT'])) !== false)
 		{	$filename = substr($filename, $pos);
@@ -1588,6 +1643,7 @@ class FcgiRequest
 	public bool $params_complete = false;
 	public bool $stdin_complete = false;
 	public bool $stdin_success = true;
+	public ?string $content_type = null;
 	public array $post = [];
 	public array $files = [];
 	public array $uploaded_files = [];
@@ -1609,6 +1665,9 @@ class FcgiRequest
 				{	$this->params_complete = true;
 					$this->request_id = $header['request_id'];
 
+					// Set PHP_AUTH_USER and PHP_AUTH_PW
+					$this->http_authorization();
+
 					// Set $this->is_urlencoded or $this->form_data
 					$type = $this->nvp->params['CONTENT_TYPE'] ?? null;
 					if ($type !== null)
@@ -1625,11 +1684,11 @@ class FcgiRequest
 							}
 							$type = substr($type, 0, $pos);
 						}
-						$type = trim($type);
-						if (strcasecmp($type, 'application/x-www-form-urlencoded') == 0)
+						$this->content_type = strtolower(trim($type));
+						if ($this->content_type === 'application/x-www-form-urlencoded')
 						{	$this->is_urlencoded = true;
 						}
-						else if (strcasecmp($type, 'multipart/form-data')==0 and strlen($boundary)>0)
+						else if ($this->content_type==='multipart/form-data' and strlen($boundary)>0)
 						{	$this->form_data = new MulpipartFormData($boundary, $_SERVER['CONTENT_LENGTH'] ?? 0, $this->stdin);
 							$this->stdin = '';
 						}
@@ -1659,13 +1718,20 @@ class FcgiRequest
 				$length = $header['length'];
 				if ($length == 0)
 				{	$this->stdin_complete = true;
-
-					// Interpret the STDIN according to CONTENT_TYPE
-					if ($this->is_urlencoded)
-					{	parse_str($this->stdin, $this->post);
+					if ($header['request_id'] == 0) // when POST body exceeds ini_get('post_max_size'), the parent signals me about this by sending zero request_id in the last FCGI_STDIN packet. see above
+					{	$this->stdin = '';
+						$this->post = [];
+						$this->files = [];
+						$this->uploaded_files = [];
 					}
-					else if ($this->form_data !== null)
-					{	$this->stdin_success = $this->form_data->take_result($this->post, $this->files, $this->uploaded_files);
+					else
+					{	// Interpret the STDIN according to CONTENT_TYPE
+						if ($this->is_urlencoded)
+						{	parse_str($this->stdin, $this->post);
+						}
+						else if ($this->form_data !== null)
+						{	$this->stdin_success = $this->form_data->take_result($this->post, $this->files, $this->uploaded_files);
+						}
 					}
 				}
 				else if ($this->form_data === null)
@@ -1677,64 +1743,76 @@ class FcgiRequest
 			}
 		}
 	}
+
+	private function http_authorization()
+	{	$auth = $this->nvp->params['HTTP_AUTHORIZATION'] ?? null;
+		if ($auth !== null)
+		{	$pos = strpos($auth, ' ');
+			if ($pos === 5)
+			{	if (strcasecmp(substr($auth, 0, 5), 'Basic') === 0)
+				{	list($this->nvp->params['PHP_AUTH_USER'], $this->nvp->params['PHP_AUTH_PW']) = explode(':', base64_decode(substr($auth, 6)));
+				}
+			}
+			// TODO: digest
+		}
+	}
 }
 
 class Request
-{	public array $server;
+{	private bool $stdin_written;
+	private FcgiRequest $request;
 	private $m_get = null;
+	private $m_post = null;
 
-	public function __construct(string $data)
-	{	$request = new FcgiRequest;
+	public function __construct(string $data, bool $stdin_written)
+	{	$this->stdin_written = $stdin_written;
+		$this->request = new FcgiRequest;
 		$offset = 0;
-		$request->read($data, $offset);
-		$this->server = $request->nvp->params;
+		$this->request->read($data, $offset);
 	}
 
 	public function __get($name)
-	{	if ($name == 'get')
-		{	if ($this->m_get === null)
-			{	parse_str($this->server['QUERY_STRING'], $this->m_get);
-			}
-			return $this->m_get;
-		}
-		else
-		{	return null;
-		}
-	}
-}
+	{	switch ($name)
+		{	case 'server':
+				return $this->request->nvp->params;
 
-function fcgi_get_record_header(string $data, &$offset)
-{	$len = strlen($data) - $offset;
-	if ($len >= 8)
-	{	$header = unpack('Ctype/nrequest_id/nlength/Cpadding', $data, $offset+1);
-		$record_len = 8 + $header['length'] + $header['padding'];
-		if ($len >= $record_len)
-		{	$offset += $record_len;
-			return $header;
-		}
-	}
-}
+			case 'get':
+				if ($this->m_get === null)
+				{	parse_str($this->request->nvp->params['QUERY_STRING'], $this->m_get);
+				}
+				return $this->m_get;
 
-function fcgi_pack_data(int $type, int $request_id, string $data): string
-{	$packaged_data = '';
-	$length = strlen($data);
-	if ($length > 0)
-	{	while (true)
-		{	if ($length > 0xFFF8) // 0xFFF9 .. 0xFFFF will be padded to 0x10000
-			{	$packaged_data .= pack("C2n2x2a65528", 1, $type, $request_id, 0xFFF8, $data); // assume: 0xFFF8 == 65528
-				$data = substr($data, 0xFFF8);
-				$length -= 0xFFF8;
-			}
-			else
-			{	$padding = (8 - $length%8) % 8;
-				$full_length = $length + $padding;
-				$packaged_data .= pack("C2n2Cxa$full_length", 1, $type, $request_id, $length, $padding, $data);
-				break;
-			}
+			case 'content_type':
+				return $this->request->content_type; // lowercased substring of $_SERVER['CONTENT_TYPE'] before first ';'
+
+			case 'post':
+				if ($this->m_post === null)
+				{	if ($this->stdin_written or $this->request->content_type==='multipart/form-data')
+					{	// if stdin is complete or if form-data. in case of form-data $this->request->post contains parameters read so far, and $this->stdin is empty
+						$this->m_post = $this->request->post;
+					}
+					else if ($this->request->content_type === 'application/x-www-form-urlencoded')
+					{	// if incomplete x-www-form-urlencoded data, i will cut partial parameter at the end, and parse the rest
+						$stdin = $this->request->stdin;
+						$pos = strrpos('&', $stdin);
+						if ($pos > 0)
+						{	parse_str(substr($stdin, 0, $pos), $this->m_post);
+						}
+						else
+						{	$this->m_post = [];
+						}
+					}
+				}
+				return $this->m_post;
+
+			case 'input':
+				return $this->request->stdin; // can be cut, and in case of form-data, it will be empty (and $this->post will contain parameters read so far)
+
+			case 'input_complete':
+				return $this->stdin_written;
 		}
+		return null;
 	}
-	$packaged_data .= pack("C2nx4", 1, $type, $request_id); // terminate stream
-	return $packaged_data;
 }
 
 /**	According to: https://www.w3.org/Protocols/rfc1341/7_2_Multipart.html
@@ -1767,8 +1845,8 @@ class MulpipartFormData
 
 	private string $boundary; // from CONTENT_TYPE HTTP header
 	private int $content_length = 0; // the CONTENT_LENGTH HTTP header
-	private int $read_content_length = 0; // how many bytes passed to read()
 	private string $data = ''; // buffer for input data
+	private int $read_content_length = 0; // how many bytes passed to read()
 	private string $header_name = ''; // is valid in S_HEADER_VALUE
 	private string $name = ''; // is valid in S_BODY
 	private string $filename = ''; // is valid in S_BODY
@@ -1781,8 +1859,15 @@ class MulpipartFormData
 	private array $uploaded_files = []; // flat array with all tmp_names
 	private int $state = self::S_INITIAL; // parser state
 
+	private static float $upload_max_filesize = -1.0; // the ini_get('upload_max_filesize')
+	private static float $max_file_uploads = -1.0; // the ini_get('max_file_uploads')
+
 	public function __construct(string $boundary, int $content_length, string $data)
-	{	$this->boundary = $boundary;
+	{	if (self::$upload_max_filesize === -1.0)
+		{	self::$upload_max_filesize = conv_units(ini_get('upload_max_filesize')); // TODO: respect
+			self::$max_file_uploads = conv_units(ini_get('max_file_uploads')); // TODO: respect
+		}
+		$this->boundary = $boundary;
 		$this->content_length = $content_length;
 		$this->read($data);
 	}
@@ -1961,6 +2046,61 @@ class MulpipartFormData
 		$uploaded_files = $this->uploaded_files;
 		return true;
 	}
+}
+
+function fcgi_get_record_header(string $data, &$offset)
+{	$len = strlen($data) - $offset;
+	if ($len >= 8)
+	{	$header = unpack('Ctype/nrequest_id/nlength/Cpadding', $data, $offset+1);
+		$record_len = 8 + $header['length'] + $header['padding'];
+		if ($len >= $record_len)
+		{	$offset += $record_len;
+			return $header;
+		}
+	}
+}
+
+function fcgi_pack_data(int $type, int $request_id, string $data): string
+{	$packaged_data = '';
+	$length = strlen($data);
+	if ($length > 0)
+	{	while (true)
+		{	if ($length > 0xFFF8) // 0xFFF9 .. 0xFFFF will be padded to 0x10000
+			{	$packaged_data .= pack("C2n2x2a65528", 1, $type, $request_id, 0xFFF8, $data); // assume: 0xFFF8 == 65528
+				$data = substr($data, 0xFFF8);
+				$length -= 0xFFF8;
+			}
+			else
+			{	$padding = (8 - $length%8) % 8;
+				$full_length = $length + $padding;
+				$packaged_data .= pack("C2n2Cxa$full_length", 1, $type, $request_id, $length, $padding, $data);
+				break;
+			}
+		}
+	}
+	$packaged_data .= pack("C2nx4", 1, $type, $request_id); // terminate stream
+	return $packaged_data;
+}
+
+function conv_units($value, bool $is_time=false)
+{	$units = null;
+	if (preg_match('~[a-z]+$~i', $value, $match))
+	{	$units = strtolower($match[0]);
+		$value = substr($value, 0, -strlen($units));
+	}
+	$value = trim($value);
+	if (!is_numeric($value))
+	{	return false;
+	}
+	$value = (float)$value;
+	switch ($units)
+	{	case 'k': return $value*1024; // kilobytes (kibibytes)
+		case 'm': return $is_time ? $value*60 : $value*(1024*1024); // minutes, megabytes (mebibytes)
+		case 'g': return $value*(1024*1024*1024); // gigabytes (gibibytes)
+		case 'h': return $value*(60*60); // hours
+		case 'd': return $value*(24*60*60); // days
+	}
+	return $value;
 }
 
 function console_log(callable $onerror_func, $msg, Throwable $exception=null)

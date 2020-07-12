@@ -45,8 +45,10 @@ The `Server` constructor takes array with configuration parameters. Their meanin
 Now we need to start this script from console.
 
 ```
-php server.php
+sudo php server.php
 ```
+
+This script requires superuser rights, because it's going to create 'listen' socket, and it's parent directories. Then it switches user to one specified in the given configuration.
 
 If we want to daemonize this service, we can either implement daemonization in the script, or we can use external software. For example in Ubuntu we can:
 
@@ -222,6 +224,20 @@ By default there's only 1 pool called `''` (empty string). The 'pm.max_children'
 To catch and examine incoming HTTP requests we can set `$server->onrequest()` callback.
 
 ```php
+	public function onrequest(callable $onrequest_func=null, int $catch_input_limit=0)
+```
+
+`$onrequest_func` callback receives a `Request` object, that has the following fields:
+
+- `$request->server` - the `$_SERVER` of the request.
+- `$request->get` - the `$_GET` of the request.
+- `$request->post` - the `$_POST` of the request. PhpWebNode will read and buffer up to `$catch_input_limit` bytes of request POST body before calling `$onrequest_func`. If the body is longer, `$request->post` will contain only complete parameters read so far. If Content-Type of the body is not one of `application/x-www-form-urlencoded` or `multipart/form-data`, the `$request->post` will be empty array.
+- `$request->input` - the `file_get_contents('php://input')` of the request. If POST body was longer than `$catch_input_limit`, it will be incomplete. If Content-Type was `multipart/form-data`, this will be empty string.
+- `$request->input_complete` - true if `$request->input` is the complete POST body.
+- `$request->content_type` - lowercased substring of $_SERVER['CONTENT_TYPE'] of the request before first semicolon.
+
+`$onrequest_func` allows you to decide to which pool to forward the incoming HTTP request by returning pool Id or name (string).
+```php
 <?php
 
 require_once 'php-web-node/php-web-node.php';
@@ -245,21 +261,18 @@ $server->onrequest
 (	function(Request $request)
 	{	$db_id = $request->get['db-id'] ?? null;
 		return $db_id=='a' ? 'A' : 'B';
-	}
+	},
+	8*1024
 );
 $server->serve();
 ```
 
-The `$server->onrequest()` callback allows you to decide to which pool to forward the HTTP request. This function receives a `Request` object, that has 2 fields:
+It's important to return only fixed number of value alternatives. In the example above we return 2 alternatives: 'A' and 'B', so we will get 2 pools with 5 ('pm.max_children') processes in each pool. If you cease returning some value from `$onrequest_func` callback, the corresponding pool will be eventually freed.
 
-- `$request->get` - the $_GET of the request
-- `$request->server` - the $_SERVER of the request
-
-And this function must return a string, which is the pool Id. It's important to return only fixed number of value alternatives. In the example above we return 2 alternatives: 'A' and 'B', so we will get 2 pools with 5 ('pm.max_children') processes in each pool. If you cease returning some value from `$server->onrequest()` callback, the corresponding pool will be eventually freed.
 
 Child process can check it's pool Id by calling `PhpWebNode\get_pool_id()`.
 
-Another thing that `$server->onrequest()` callback can do, is throwing exception to cancel the request without forwarding it to a child process.
+Another thing that `$onrequest_func` callback can do, is throwing exception to cancel the request without forwarding it to a child process.
 
 ```php
 $server->onrequest
