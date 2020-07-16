@@ -24,7 +24,7 @@ require_once 'php-web-node/php-web-node.php';
 use PhpWebNode\Server;
 
 $server = new Server
-(	[	'listen' => '/run/php-web-node/main.sock',
+(	[	'listen' => '/run/php-web-node/main.sock', // or: '127.0.0.1:10000', '[::1]:10000'
 		'listen.owner' => 'www-data',
 		'listen.group' => 'johnny',
 		'listen.mode' => 0700,
@@ -42,6 +42,8 @@ $server->serve();
 
 The `Server` constructor takes array with configuration parameters. Their meaning is the same as in PHP-FPM, see [here](https://www.php.net/manual/en/install.fpm.configuration.php). Only parameters shown in the above example are supported.
 
+Change `johnny` to your user name, or create dedicated user to run the application from it.
+
 Now we need to start this script from console.
 
 ```
@@ -53,7 +55,7 @@ This script requires superuser rights, because it's going to create 'listen' soc
 If we want to daemonize this service, we can either implement daemonization in the script, or we can use external software. For example in Ubuntu we can:
 
 ```
-daemon --name=php-web-node --respawn --stdout=/tmp/php-web-node.log --stderr=/tmp/php-web-node-err.log -- php server.php
+sudo daemon --name=php-web-node --respawn --stdout=/tmp/php-web-node.log --stderr=/tmp/php-web-node-err.log -- php server.php
 ```
 
 ### Step 2. Set up web server
@@ -62,20 +64,26 @@ If you have a web server like Apache or Nginx that is already configured to work
 
 ```
 <VirtualHost *:80>
-	ServerName johnny.com
-	DocumentRoot /var/www/johnny.com
+	ServerName wntest.com
+	DocumentRoot /var/www/wntest.com
 
 	<FilesMatch \.php$>
 		SetHandler "proxy:unix:/run/php-web-node/main.sock|fcgi://localhost"
+		# or IPv4: SetHandler "proxy:fcgi://127.0.0.1:10000"
+		# or IPv6: SetHandler "proxy:fcgi://[::1]:10000"
 	</FilesMatch>
 </VirtualHost>
 ```
 
-The DocumentRoot directory must exist.
+The DocumentRoot directory must exist, so create `/var/www/wntest.com`, or different directory on your choice, and put some test file in it, like `index.php`. Later you will be able to access it through `ServerName` URL. In example above, it's `wntest.com`, so the full URL will be `http://wntest.com/index.php`, or maybe `http://wntest.com/`. Also include `wntest.com` in your `/etc/hosts` file, like:
+
+```
+127.0.0.1	wntest.com
+```
 
 ### Step 3. Update PHP scripts
 
-There's important difference between PHP-FPM and php-web-node. Let's say we have such `hello.php` script:
+There's important difference between PHP-FPM and php-web-node. Let's say we have such `index.php` script:
 
 ```php
 <?php
@@ -88,9 +96,9 @@ $n_request++;
 
 If we'll serve this script with PHP-FPM, it will always show "Request 1", and process Id can change from request to request. From bunch of requests a percent of them will show the same process Id, because each child process (by default) processes many incoming requests.
 
-If we'll serve it with php-web-node, we'll see that `$n_request` is incrementing in each child process independently. If 'pm.max_children' is set to 2, as in example above, there will be up to 2 child processes where each of them preserves it's global variables state.
+If we'll serve it with php-web-node, we'll see that `$n_request` is incrementing. Probably you will see the same process Id, because your server can handle all the requests that come when you refresh the page with 1 child process. But there can be up to 'pm.max_children' (2 in the above example) processes, and request counter will increment in each child process independently.
 
-Child process executes `require 'hello.php'` each request within the same environment. This puts limitations on what `hello.php` can do. For example:
+Child process executes `require 'index.php'` each request within the same environment. This puts limitations on what `index.php` can do. For example:
 
 ```php
 <?php
@@ -103,7 +111,7 @@ function get_n_request()
 echo "Request ", get_n_request(), " from ", posix_getpid();
 ```
 
-This script does the same, but it declares a function in global namespace. Doing `require 'hello.php'` second time will give error
+To run this new script, you need to stop the `server.php` application, and rerun it again. This new script does the same thing, but it declares a function in global namespace. Doing `require 'index.php'` second time will give error:
 
 ```
 PHP Fatal error:  Cannot redeclare get_n_request()
@@ -160,7 +168,7 @@ PhpWebNode\set_request_handler
 
 ## Understanding the master application
 
-The master application configures and starts the FastCGI server. Also it can perform another operations, but it's important to understand, that no blocking system calls must be executed from it, because the blocking calls, like connecting to database, will pause handling incoming HTTP requests. The following master application is alright, it only performs nonblocking operations.
+The master application configures and starts the FastCGI server. Also it can perform another operations, but it's important to understand, that no blocking system calls must be executed from it, because blocking calls, like connecting to database, will pause handling incoming HTTP requests. The following master application is alright, it only performs nonblocking operations.
 
 ```php
 <?php
@@ -193,7 +201,7 @@ $server->onerror
 	}
 );
 $server->onrequestcomplete
-(	function($messages, $time_took) use(&$n_requests, &$requests_time_took)
+(	function($pool_id, $messages, $time_took) use(&$n_requests, &$requests_time_took)
 	{	$n_requests++;
 		$requests_time_took += $time_took;
 	}
@@ -210,6 +218,8 @@ $server->serve();
 ```
 
 The `$server->serve()` function starts the server main loop, that runs forever, so this function doesn't return or throw exceptions.
+
+This application prints each 6 sec (10 times a minute) how many requests were completed, and average request time. This time is measured since a child process took a request job, and till a complete response was received from the child. Real request time is longer.
 
 ## Process pools
 

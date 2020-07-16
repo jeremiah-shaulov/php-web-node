@@ -5,6 +5,10 @@ namespace PhpWebNode;
 class Server extends _\Server {}
 class Request extends _\Request {}
 
+function php_web_node_version()
+{	return '0.1.0';
+}
+
 function is_php_web_node()
 {	return _\Child::$is_php_web_node;
 }
@@ -222,11 +226,19 @@ class Server
 	{	$listen = $options['listen'] ?? '127.0.0.1:10000';
 		$is_unix = strpos($listen, '/') !== false;
 		$port = 0;
+		$sock_domain = AF_UNIX;
 		if (!$is_unix)
-		{	$pos = strrpos($listen, ':');
+		{	$sock_domain = AF_INET;
+			$pos = strrpos($listen, ':');
 			if ($pos>0 and $listen[$pos-1]!=':')
-			{	$port = intval(substr($port, $pos+1));
-				$listen = substr($listen, 0, $pos);
+			{	$port = intval(substr($listen, $pos+1));
+				if ($listen[0]=='[' and $listen[$pos-1]==']')
+				{	$listen = substr($listen, 1, $pos-2); // assume: IPv6 address, like [::1]:10000
+					$sock_domain = AF_INET6;
+				}
+				else
+				{	$listen = substr($listen, 0, $pos);
+				}
 			}
 			else if (is_numeric($listen))
 			{	$port = intval($listen);
@@ -234,8 +246,8 @@ class Server
 			}
 		}
 
-		$this->sock_domain = $is_unix ? AF_UNIX : AF_INET;
-		$this->sock_type =   SOCK_STREAM;
+		$this->sock_domain = $sock_domain;
+		$this->sock_type = SOCK_STREAM;
 		$this->sock_protocol = $is_unix ? 0 : SOL_TCP;
 		$this->address = $listen;
 		$this->port = $port;
@@ -480,9 +492,7 @@ class Server
 										// Find read_request_buffer
 										foreach ($accepted->read_request_buffers as $n_buffer => $read_request_buffer) // $read_request_buffer will not exist in $accepted if i rejected this request with FCGI_OVERLOADED
 										{	if ($read_request_buffer->request_id == $request_id)
-											{	http_response_code(500);
-												Child::$headers = [];
-												$this->end_request($accepted, $request_id, "Request aborted");
+											{	$this->end_request($accepted, $request_id, 500, true);
 												array_splice($accepted->read_request_buffers, $n_buffer, 1);
 												break 2;
 											}
@@ -623,6 +633,10 @@ class Server
 							$accepted->buffer_write .= substr($child->buffer, 0, $offset-$len);
 							$child->buffer = substr($child->buffer, $offset);
 							$offset = 0;
+						}
+						else
+						{	assert($header['type'] == FCGI_STDOUT);
+							$child->read_one_stdout_packet = true;
 						}
 					}
 					if ($offset > 0)
@@ -780,7 +794,7 @@ class Server
 	}
 
 	/**	Set callback function that will be called once for each completed HTTP request.
-		This function will get 2 parameters: array $messages, float $time_took.
+		This function will get 3 parameters: string $pool_id, array $messages, float $time_took.
 		The $messages is array of values sent from child through PhpWebNode\send_message($message).
 		The $time_took is how much time this request took to process in seconds.
 		This function must not change error handler (set_error_handler()). If you load some library from within this function, make sure it doesn't do so.
@@ -858,9 +872,7 @@ class Server
 				return;
 			}
 			if ($child === false)
-			{	http_response_code(503);
-				Child::$headers = [];
-				$this->end_request($accepted, $read_request_buffer->request_id, "");
+			{	$this->end_request($accepted, $read_request_buffer->request_id, 503, false);
 				array_splice($accepted->read_request_buffers, $n_buffer, 1);
 				console_log($this->onerror_func, "503 Server busy");
 			}
@@ -872,9 +884,15 @@ class Server
 		}
 	}
 
-	private function end_request(ServerAcceptedSock $accepted, int $request_id, string $default_message)
-	{	// TODO: custom handler
-		$accepted->buffer_write .= fcgi_pack_data(FCGI_STDOUT, $request_id, Child::get_headers_str().$default_message) . new FcgiRecordEndRequest($request_id, http_response_code()==503 ? FCGI_OVERLOADED : FCGI_REQUEST_COMPLETE);
+	private function end_request(ServerAcceptedSock $accepted, int $request_id, int $status, bool $read_one_stdout_packet)
+	{	if (!$read_one_stdout_packet)
+		{	http_response_code($status);
+			Child::$headers = [];
+			$default_message = "";
+			// TODO: custom handler
+			$accepted->buffer_write .= fcgi_pack_data(FCGI_STDOUT, $request_id, Child::get_headers_str().$default_message);
+		}
+		$accepted->buffer_write .= new FcgiRecordEndRequest($request_id, $status==503 ? FCGI_OVERLOADED : FCGI_REQUEST_COMPLETE);
 		$accepted->n_mux_children--;
 	}
 
@@ -882,16 +900,14 @@ class Server
 	{	$child = $this->employed_children[$n_child];
 		$accepted = $this->server_accepted_socks[$child->n_accepted];
 		if ($child_state != CHILD_STATE_ALIVE)
-		{	http_response_code(500);
-			Child::$headers = [];
-			$this->end_request($accepted, $child->request_id, "");
+		{	$this->end_request($accepted, $child->request_id, 500, $child->read_one_stdout_packet);
 		}
 		else
 		{	$accepted->n_mux_children--;
 		}
 		if ($this->onrequestcomplete_func!==null and $child_state==CHILD_STATE_ALIVE)
 		{	try
-			{	call_user_func($this->onrequestcomplete_func, unserialize($child->stderr_buffer), microtime(true)-$child->since);
+			{	call_user_func($this->onrequestcomplete_func, $child->pool_id, unserialize($child->stderr_buffer), microtime(true)-$child->since);
 			}
 			catch (Throwable $e)
 			{	console_log($this->onerror_func, "Error in onrequestcomplete function", $e);
@@ -1005,29 +1021,7 @@ class ChildrenPool
 			$child = null;
 		}
 		else
-		{	// Select ready child from pool. I saw from practice that although children in pool are not serving requests, sending a new request to them may stuck for >10sec
-			$read = [];
-			$write = [];
-			$except = [];
-			foreach ($this->pools[$pool_id] as $child)
-			{	$write[] = $child->sock;
-			}
-			if ($write)
-			{	$write_orig = $write;
-				if (socket_select($read, $write, $except, 0) === false)
-				{	console_log($this->onerror_func, socket_strerror(socket_last_error()));
-					$write = [];
-				}
-			}
-			if ($write)
-			{	// There's one ready
-				$n = array_search(end($write), $write_orig); // pick from end, so in the beginning of the pool array there will remain rarely used children - candidates to be stopped
-				$child = array_splice($this->pools[$pool_id], $n, 1)[0];
-			}
-			else
-			{	// None ready
-				$child = null;
-			}
+		{	$child = array_pop($this->pools[$pool_id]);
 		}
 		if ($child === null)
 		{	if ($this->n_children[$pool_id] < $this->pm_max_children)
@@ -1069,6 +1063,7 @@ class ChildrenPool
 	{	$child->buffer = '';
 		$child->stdin_written = false;
 		$child->is_reading_back = false;
+		$child->read_one_stdout_packet = false;
 		$child->is_aborted = false;
 		$child->since = microtime(true);
 		$child->n_requests++;
@@ -1182,10 +1177,11 @@ class Child
 	public bool $stdin_written = false; // is set when both FCGI_PARAMS and FCGI_STDIN records are read from the server to $buffer
 	public int $stdin_len = 0;
 	public bool $is_reading_back = false; // is set when $stdin_written and strlen($buffer)==0, meaning that the whole request is written to $sock, and now we are reading the response back from $sock to $buffer
+	public bool $read_one_stdout_packet = false; // at least 1 FCGI_STDOUT packet is read back from child process
 
 	// all the static fields are used by child process only
 	public static bool $is_php_web_node = false;
-	public static string $the_pool_id;
+	public static string $the_pool_id = '';
 	public static array $request_handlers = [];
 	public static array $messages = [];
 	public static $headers = [];
@@ -1665,7 +1661,7 @@ class FcgiRequest
 				{	$this->params_complete = true;
 					$this->request_id = $header['request_id'];
 
-					// Set PHP_AUTH_USER and PHP_AUTH_PW
+					// Set PHP_AUTH_USER, PHP_AUTH_PW and PHP_AUTH_DIGEST
 					$this->http_authorization();
 
 					// Set $this->is_urlencoded or $this->form_data
@@ -1753,7 +1749,11 @@ class FcgiRequest
 				{	list($this->nvp->params['PHP_AUTH_USER'], $this->nvp->params['PHP_AUTH_PW']) = explode(':', base64_decode(substr($auth, 6)));
 				}
 			}
-			// TODO: digest
+			else if ($pos === 6)
+			{	if (strcasecmp(substr($auth, 0, 6), 'Digest') === 0)
+				{	$this->nvp->params['PHP_AUTH_DIGEST'] = substr($auth, 7);
+				}
+			}
 		}
 	}
 }
