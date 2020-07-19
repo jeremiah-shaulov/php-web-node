@@ -5,6 +5,20 @@ PhpWebNode is PHP-FPM implementation written in PHP that allows to preserve reso
 
 It's written in PHP, so i expected that my application will slow down a little comparing to PHP-FPM. I was surprised that the application became a little faster. Actually php-web-node removes need to reinitialize resources, and reconnect to database.
 
+## What's supported
+
+Most of PHP features that i know, except `$_SESSION` are supported. Most existing PHP scripts will work as with PHP-FPM, except principal distinction explained below, in "Step 3. Update PHP scripts".
+
+PhpWebNode implements complete FastCGI protocol, including connection multiplexing, however as far as i know, currently none of popular web servers support this feature. [More info](https://stackoverflow.com/questions/25556168/nginx-fastcgi-uses-management-records-if-not-then-what).
+
+## Installation
+
+Create a directory for your application, `cd` to it, and issue:
+
+```
+composer require jeremiah-shaulov/php-web-node
+```
+
 ## How to use php-web-node
 
 To use php-web-node we need to pass 3 steps:
@@ -20,7 +34,7 @@ We need a master application that will work as PHP-FPM service. Let's call it se
 ```php
 <?php
 
-require_once 'php-web-node/php-web-node.php';
+require_once 'vendor/autoload.php';
 use PhpWebNode\Server;
 
 $server = new Server
@@ -125,7 +139,7 @@ There are 2 solutions to this problem.
 ```php
 <?php
 
-require_once 'php-web-node/php-web-node.php';
+require_once 'vendor/autoload.php';
 
 function get_n_request()
 {	static $n_request = 1;
@@ -149,7 +163,7 @@ Another important difference between php-web-node and PHP-FPM is that with php-w
 ```php
 <?php
 
-require_once 'php-web-node/php-web-node.php';
+require_once 'vendor/autoload.php';
 use function PhpWebNode\header;
 
 function get_n_request()
@@ -173,7 +187,7 @@ The master application configures and starts the FastCGI server. Also it can per
 ```php
 <?php
 
-require_once 'php-web-node/php-web-node.php';
+require_once 'vendor/autoload.php';
 use PhpWebNode\Server;
 
 $n_requests = 0;
@@ -250,7 +264,7 @@ public function onrequest(callable $onrequest_func=null, int $catch_input_limit=
 ```php
 <?php
 
-require_once 'php-web-node/php-web-node.php';
+require_once 'vendor/autoload.php';
 use PhpWebNode\{Server, Request};
 
 $server = new Server
@@ -295,3 +309,76 @@ $server->onrequest
 	}
 );
 ```
+
+## PHP MySQL connections pool implementation
+
+As we saw above, process pool can act like database connections pool.
+
+Please, keep in mind, that there's no way in PHP to reset a MySQL connection using [mysql_reset_connection()](https://dev.mysql.com/doc/refman/8.0/en/mysql-reset-connection.html), at least i'm not aware of such. Therefore in the beginning of each request we'll need to clean up what we can, and we can rollback ongoing transaction if it was not committed by previous request.
+
+Also you need to know that depending on what queries you execute, memory consumption on MySQL end can decline with every query. Eventually this can make MySQL server unresponsive. So there's limit on how many times we can reuse our connection, and we need to reconnect periodically anyway. Even reusing 10 times each connection, will dramatically release network pressure in our system.
+
+In my experiments, with PHP-FPM i saw 2500 open sockets all the time, where almost all of them were in TIME_WAIT state.
+
+```
+sudo netstat -putnw | wc -l
+```
+
+With php-web-node reusing each connection 10 times, this number reduced to 700.
+
+Example of client script that implements DB connections pool:
+
+```php
+<?php
+
+const DB_DSN = 'mysql:host=localhost;dbname=information_schema';
+const DB_USER = 'root';
+const DB_PASSWORD = 'root';
+const RECONNECT_EACH_N_REQUESTS = 10;
+
+function get_pdo()
+{	static $pdo = null;
+	static $n_request = 0;
+
+	if ($n_request++ % RECONNECT_EACH_N_REQUESTS == 0)
+	{	$pdo = new PDO(DB_DSN, DB_USER, DB_PASSWORD);
+		$n_request = 1;
+	}
+	else
+	{	// Reset the connection
+		$pdo->exec("ROLLBACK");
+	}
+
+	return $pdo;
+}
+
+PhpWebNode\set_request_handler
+(	__FILE__,
+	function()
+	{	$pdo = get_pdo();
+		$cid = $pdo->query("SELECT Connection_id()")->fetchColumn();
+		echo "Connection ID = $cid";
+	}
+);
+```
+
+And as usual, in master application we specify pool parameters:
+
+```php
+$server = new Server
+(	[	'listen' => '/run/php-web-node/main.sock',
+		'listen.owner' => 'www-data',
+		'listen.group' => 'johnny',
+		'listen.mode' => 0700,
+		'listen.backlog' => 0,
+		'user' => 'johnny',
+		'group' => null,
+		'pm.max_requests' => 1000,
+		'pm.max_children' => 5,
+		'pm.process_idle_timeout' => 30,
+		'request_terminate_timeout' => 10,
+	]
+);
+```
+
+The pool will have up to `pm.max_children` concurrent database connections. If one of them remains idle for more than `pm.process_idle_timeout` seconds, it will be closed. Each `pm.max_requests` requests child process will be retired, so we could set `pm.max_requests` to 10, and database connection would reconnect each 10 requests, but it's better to set `pm.max_requests` to a big value because this will save CPU spent on stopping child process, and forking it again.

@@ -332,10 +332,14 @@ class Server
 	public function serve()
 	{	try
 		{	// Set error handler, that will not throw exceptions on warning. I will handle errors by checking return value for functions like socket_*()
+			$error_reporting = error_reporting();
 			set_error_handler
-			(	function($errno, $errstr, $file, $line)
-				{	console_log($this->onerror_func, "Error in $file:$line: $errstr");
-				}
+			(	function($errno, $errstr, $file, $line) use ($error_reporting)
+				{	if (error_reporting($error_reporting) != 0) // error_reporting returns zero if "@" operator was used
+					{	console_log($this->onerror_func, "Error in $file:$line: $errstr");
+					}
+				},
+				$error_reporting
 			);
 
 			// Set $server
