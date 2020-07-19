@@ -1,0 +1,17 @@
+{	"name": "jeremiah-shaulov/php-web-node",
+	"description": "PHP-FPM implementation that allows to preserve resources (global variables) between requests, so database connections pool is possible",
+	"keywords": ["db-pool"],
+	"homepage": "https://github.com/jeremiah-shaulov/php-web-node",
+	"authors":
+	[	{	"name": "Jeremiah Shaulov",
+			"email": "jeremiah-shaulov@gmail.com",
+			"role": "Developer"
+		}
+	],
+	"require":
+	{	"php": "^7.4"
+	},
+	"autoload":
+	{	"files": ["php-web-node.php"]
+	}
+}

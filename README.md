@@ -1,5 +1,5 @@
 # php-web-node
-PhpWebNode is PHP-FPM implementation in PHP that allows to preserve resources (global variables) between requests, so DB connections pool is possible. Applications based on this library can be used instead of PHP-FPM. PhpWebNode acts like FastCGI server, to which web server (like Apache) will send HTTP requests. It will spawn child processes that will handle the requests synchronously. Several (up to 'pm.max_children') children will run in parallel, and each child will sequentially process incoming requests, preserving global (and static) variables.
+PhpWebNode is PHP-FPM implementation written in PHP that allows to preserve resources (global variables) between requests, so database connections pool is possible. Applications based on this library can be used instead of PHP-FPM. PhpWebNode acts like FastCGI server, to which web server (like Apache) will send HTTP requests. It will spawn child processes that will handle the requests synchronously. Several (up to 'pm.max_children') children will run in parallel, and each child will sequentially process incoming requests, preserving global (and static) variables.
 
 ## How fast is php-web-node
 
@@ -234,7 +234,7 @@ By default there's only 1 pool called `''` (empty string). The 'pm.max_children'
 To catch and examine incoming HTTP requests we can set `$server->onrequest()` callback.
 
 ```php
-	public function onrequest(callable $onrequest_func=null, int $catch_input_limit=0)
+public function onrequest(callable $onrequest_func=null, int $catch_input_limit=0)
 ```
 
 `$onrequest_func` callback receives a `Request` object, that has the following fields:
