@@ -264,7 +264,7 @@ class Server
 
 		// TODO: fork_call
 
-		$this->children_pool = new ChildrenPool($this->pm_max_children, $this->pm_process_idle_timeout, $this->pm_max_requests);
+		$this->children_pool = new ChildrenPool($this->pm_max_children, $this->pm_process_idle_timeout, $this->pm_max_requests, $this->request_terminate_timeout);
 	}
 
 	/**	If we're going to create a socket node, we need to prepare it's parent directory.
@@ -994,12 +994,14 @@ class ChildrenPool
 	private int $pm_max_children;
 	private float $pm_process_idle_timeout;
 	private int $pm_max_requests;
+	private int $time_limit;
 	public $onerror_func='error_log', $onresolvepath_func, $onpreparechild_func, $onchildstart_func, $onchildend_func;
 
-	public function __construct(int $pm_max_children, float $pm_process_idle_timeout, int $pm_max_requests)
+	public function __construct(int $pm_max_children, float $pm_process_idle_timeout, int $pm_max_requests, float $request_terminate_timeout)
 	{	$this->pm_max_children = $pm_max_children;
 		$this->pm_process_idle_timeout = $pm_process_idle_timeout;
 		$this->pm_max_requests = $pm_max_requests;
+		$this->time_limit = ceil($request_terminate_timeout);
 	}
 
 	/**	When a child process starts, free parent resources.
@@ -1029,7 +1031,7 @@ class ChildrenPool
 		}
 		if ($child === null)
 		{	if ($this->n_children[$pool_id] < $this->pm_max_children)
-			{	$child = new Child($pool_id, $this->onpreparechild_func, $this->onerror_func, $this->onresolvepath_func);
+			{	$child = new Child($pool_id, $this->time_limit, $this->onpreparechild_func, $this->onerror_func, $this->onresolvepath_func);
 				$this->n_children[$pool_id]++;
 			}
 			else
@@ -1037,7 +1039,7 @@ class ChildrenPool
 				{	if ($zombie_child->pool_id == $pool_id)
 					{	posix_kill($zombie_child->pid, SIGKILL);
 						array_splice($this->zombies, $i, 1);
-						$child = new Child($pool_id, $this->onpreparechild_func, $this->onerror_func, $this->onresolvepath_func);
+						$child = new Child($pool_id, $this->time_limit, $this->onpreparechild_func, $this->onerror_func, $this->onresolvepath_func);
 						break;
 					}
 				}
@@ -1186,6 +1188,7 @@ class Child
 	// all the static fields are used by child process only
 	public static bool $is_php_web_node = false;
 	public static string $the_pool_id = '';
+	public static int $time_limit = 0;
 	public static array $request_handlers = [];
 	public static array $messages = [];
 	public static $headers = [];
@@ -1193,7 +1196,7 @@ class Child
 	public static $stdin = '';
 	private static $uploaded_files = [];
 
-	public function __construct(string $pool_id, callable $onpreparechild_func, callable $onerror_func, callable $onresolvepath_func=null)
+	public function __construct(string $pool_id, int $time_limit, callable $onpreparechild_func, callable $onerror_func, callable $onresolvepath_func=null)
 	{	$sockets = [];
 		if (socket_create_pair(AF_UNIX, SOCK_STREAM, 0, $sockets) === false)
 		{	throw new Exception("socket_create_pair() error: ".socket_strerror(socket_last_error()));
@@ -1218,8 +1221,9 @@ class Child
 			socket_close($sockets[0]);
 			$onpreparechild_func();
 			try
-			{	self::$the_pool_id = $pool_id;
-				self::$is_php_web_node = true;
+			{	self::$is_php_web_node = true;
+				self::$the_pool_id = $pool_id;
+				self::$time_limit = $time_limit;
 				self::process_sequential_requests_till_socket_closes($sockets[1], $onerror_func, $onresolvepath_func);
 			}
 			catch (Throwable $e)
@@ -1344,6 +1348,7 @@ class Child
 			$gzip_ctx = null;
 			http_response_code(200);
 			clearstatcache();
+			set_time_limit(self::$time_limit);
 			$_GET = [];
 			$_POST = [];
 			$_COOKIE = [];
@@ -1456,6 +1461,9 @@ class Child
 				}
 				$buffer_write = substr($buffer_write, $n);
 			}
+
+			// 8. Get ready for next iteration
+			set_time_limit(0);
 		}
 	}
 

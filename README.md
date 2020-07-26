@@ -255,7 +255,7 @@ public function onrequest(callable $onrequest_func=null, int $catch_input_limit=
 
 - `$request->server` - the `$_SERVER` of the request.
 - `$request->get` - the `$_GET` of the request.
-- `$request->post` - the `$_POST` of the request. PhpWebNode will read and buffer up to `$catch_input_limit` bytes of request POST body before calling `$onrequest_func`. If the body is longer, `$request->post` will contain only complete parameters read so far. If Content-Type of the body is not one of `application/x-www-form-urlencoded` or `multipart/form-data`, the `$request->post` will be empty array.
+- `$request->post` - the `$_POST` of the request. PhpWebNode will read and buffer not less than `$catch_input_limit` bytes of request POST body before calling `$onrequest_func`. If the body is longer, `$request->post` will contain only complete parameters read so far. If Content-Type of the body is not one of `application/x-www-form-urlencoded` or `multipart/form-data`, the `$request->post` will be empty array.
 - `$request->input` - the `file_get_contents('php://input')` of the request. If POST body was longer than `$catch_input_limit`, it will be incomplete. If Content-Type was `multipart/form-data`, this will be empty string.
 - `$request->input_complete` - true if `$request->input` is the complete POST body.
 - `$request->content_type` - lowercased substring of $_SERVER['CONTENT_TYPE'] of the request before first semicolon.
@@ -316,7 +316,7 @@ As we saw above, process pool can act like database connections pool.
 
 Please, keep in mind, that there's no way in PHP to reset a MySQL connection using [mysql_reset_connection()](https://dev.mysql.com/doc/refman/8.0/en/mysql-reset-connection.html), at least i'm not aware of such. Therefore in the beginning of each request we'll need to clean up what we can, and we can rollback ongoing transaction if it was not committed by previous request.
 
-Also you need to know that depending on what queries you execute, memory consumption on MySQL end can decline with every query. Eventually this can make MySQL server unresponsive. So there's limit on how many times we can reuse our connection, and we need to reconnect periodically anyway. Even reusing 10 times each connection, will dramatically release network pressure in our system.
+Also you need to know that depending on what queries you execute, memory consumption on MySQL end can decline with every query. Eventually this can make MySQL server unresponsive. So there's limit on how many times we can reuse our connection, and we need to reconnect periodically anyway. Even reusing 10 times each connection, will dramatically release network pressure in your system.
 
 In my experiments, with PHP-FPM i saw 2500 open sockets all the time, where almost all of them were in TIME_WAIT state.
 
@@ -365,6 +365,11 @@ PhpWebNode\set_request_handler
 And as usual, in master application we specify pool parameters:
 
 ```php
+<?php
+
+require_once 'vendor/autoload.php';
+use PhpWebNode\Server;
+
 $server = new Server
 (	[	'listen' => '/run/php-web-node/main.sock',
 		'listen.owner' => 'www-data',
@@ -379,6 +384,7 @@ $server = new Server
 		'request_terminate_timeout' => 10,
 	]
 );
+$server->serve();
 ```
 
 The pool will have up to `pm.max_children` concurrent database connections. If one of them remains idle for more than `pm.process_idle_timeout` seconds, it will be closed. Each `pm.max_requests` requests child process will be retired, so we could set `pm.max_requests` to 10, and database connection would reconnect each 10 requests, but it's better to set `pm.max_requests` to a big value because this will save CPU spent on stopping child process, and forking it again.
